@@ -883,10 +883,13 @@ class FixtureDef:
             self._finalizers = []
 
     def execute(self, request):
+        test_is_in_class = hasattr(request.node, "cls") and request.node.cls is not None
         for argname in self._dependee_fixture_argnames(request):
             fixturedef = request._get_active_fixturedef(argname)
             if argname != "request":
                 fixturedef.addfinalizer(functools.partial(self.finish, request=request))
+            if not test_is_in_class and fixturedef.scope == "class":
+                continue
 
         my_cache_key = self.cache_key(request)
         cached_result = getattr(self, "cached_result", None)
