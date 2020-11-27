@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from _pytest.python import CallSpec2
     from _pytest.python import Function
     from _pytest.python import Metafunc
+    from _pytest.python import PyCollector
 
     _Scope = Literal["session", "package", "module", "class", "function"]
 
@@ -1024,6 +1025,7 @@ class FixtureDef(Generic[_FixtureValue]):
     def execute(self, request: SubRequest) -> _FixtureValue:
         # Get required arguments and register our own finish()
         # with their finalization.
+        self._trigger_transitive_fixtures(request)
         for argname in self._dependee_fixture_argnames(request):
             if argname == "request":
                 continue
@@ -1127,6 +1129,48 @@ class FixtureDef(Generic[_FixtureValue]):
         stack_slice_index = min([current_fix_index, *parent_fixture_indexes])
         active_fixture_argnames = all_fix_names[:stack_slice_index]
         return tuple(active_fixture_argnames) + self.argnames
+
+    def _is_autouse_fixture_for_request(self, request: SubRequest) -> bool:
+        return self.argname in self._fixturemanager._getautousenames(request.node.nodeid)
+
+    def _trigger_transitive_fixtures(self, request: SubRequest):
+        for item in self._get_items_for_scope():
+            for argname, fixturedef_list in item._fixtureinfo.name2fixturedefs.items():
+                if argname not in self._fixturemanager._arg2fixturedefs:
+                    # self has no equivalent of argname (may be defined in a deeper
+                    # nested scope, and so is not relevant)
+                    continue
+                if self._fixturemanager._arg2fixturedefs[argname][-1].scopenum >= self.scopenum:
+                    # the referenced fixture is either of the same or smaller scope, and
+                    # thus, can't be affected by self's autouse status
+                    continue
+                match = None
+                for fixdef in fixturedef_list[::-1]:
+                    for selffixdef in self._fixturemanager._arg2fixturedefs[argname][::-1]:
+                        if fixdef is selffixdef:
+                            match = fixdef
+                            break
+                    if match:
+                        request._get_active_fixturedef(argname)
+                        break
+                else:
+                    # self has no equivalent of argname (may be defined in a deeper
+                    # nested scope, and so is not relevant)
+                    continue
+
+    def _get_items_for_scope(self) -> List["Function"]:
+        """Get all of the ``:class:Function``s (items) included in this fixture's scope.
+
+        This ``:class:FixtureDef`` may possibly be reached by more ``:class:Function``s
+        than the one currently making the request for it. This goes through the list of
+        all ``:class:Function`` objects that the ``:class:Session`` knows of, finds the
+        ones that start with the same ``baseid`` as it, and returns them as a list.
+        """
+        relevant_items = []
+        for item in self._fixturemanager.session.items:
+            if (item.nodeid.startswith(self.baseid)):
+                relevant_items.append(item)
+        return relevant_items
 
     def cache_key(self, request: SubRequest) -> object:
         return request.param_index if not hasattr(request, "param") else request.param
@@ -1553,6 +1597,20 @@ class FixtureManager:
                         continue
                 autousenames.extend(basenames)
         return autousenames
+
+    def _get_items_for_scope(self) -> List["Function"]:
+        """Get all of the ``:class:Function``s (items) included in this fixture's scope.
+
+        This ``:class:FixtureDef`` may possibly be reached by more ``:class:Function``s
+        than the one currently making the request for it. This goes through the list of
+        all ``:class:Function`` objects that the ``:class:Session`` knows of, finds the
+        ones that start with the same ``baseid`` as it, and returns them as a list.
+        """
+        relevant_items = []
+        for item in self._fixturemanager.session.items:
+            if (item.nodeid.startswith(self.baseid)):
+                relevant_items.append(item)
+        return relevant_items
 
     def getfixtureclosure(
         self, fixturenames: Tuple[str, ...], parentnode, ignore_args: Sequence[str] = ()

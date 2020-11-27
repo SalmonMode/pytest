@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from typing import Type
     from typing_extensions import Literal
     from _pytest.fixtures import _Scope
+    from _pytest.fixtures import Function
 
 
 def pytest_addoption(parser: Parser) -> None:
@@ -446,7 +447,128 @@ class PyCollector(PyobjMixin, nodes.Collector):
             return (str(fspath), lineno)
 
         values.sort(key=sort_key)
+        self._unify_fixture_resolution_order(list(filter(lambda node: isinstance(node, Function), values)))
         return values
+
+    def _unify_fixture_resolution_order(self, nodes: List["Function"]):
+        """Mimic MRO, but for fixtures based on the highest autouse fixture.
+
+        It's possible for autouse fixtures to cause some shenanigans when trying to
+        figure out an appropriate stack order. Some tests in a given scope that an
+        autouse fixture applies to could request a non-autose fixture with a higher
+        scope level. For example, the autouse fixture could have a scope level of
+        'class', and the non-autouse fixture could have a scope level of 'module', while
+        one test in the relevant class requests the module-level fixture and another
+        does not.
+
+        This factors in all the fixtures that are relevant to all the nodes in the
+        relevant context, and uses the same algorithm as Python's MRO to determine a
+        coherent fixture resolution order (i.e. the order that the fixtures should be
+        executed in) for all the fixtures that would run for the tests of that context.
+        Once it has the coherent order, and has sorted it by scope, it looks at the
+        ``fixturenames`` attribute of each of the nodes, finds the index of the lowest
+        (i.e. latest executed) autouse fixture that all nodes have in common (and that
+        only executes once for all of them together), finds the point in the coherent
+        order that lines up with that common autouse fixture, and then overwrites
+        everything in each of the nodes' ``fixturenames`` attribute before that common
+        autouse point with the fixtures that came before it in the resolved fixture
+        order.
+
+        For example, with the following tests:
+
+            @pytest.fixture(scope='module')
+            def a1():
+                pass
+
+            @pytest.fixture(scope='module')
+            def a2():
+                pass
+
+            class TestThing:
+                @pytest.fixture(scope='class', autouse=True)
+                def b(self):
+                    pass
+
+                @pytest.fixture(scope='class')
+                def c(self):
+                    pass
+
+                def test_1(self, c, a1):
+                    pass
+
+                def test_2(self, c, a2):
+                    pass
+
+                def test_3(self, b):
+                    pass
+
+        They would each have these ``fixturenames`` respectively (``b`` being the common
+        point):
+
+            [a1, b, c]
+            [a2, b, c]
+            [b]
+
+        The resolved order would be this (``a1, a2, b`` being the common fixtures):
+
+            [a1, a2, b, c]
+
+        And the tests would have their ``fixturenames`` adjusted to these:
+
+            [a1, a2, b, c]
+            [a1, a2, b, c]
+            [a1, a2, b]
+        """
+        if not nodes:
+            return
+        new_order = []
+        all_fixture_sets = [node.fixturenames[:] for node in nodes]
+        while all(all_fixture_sets):
+            print(all_fixture_sets)
+            for fixturename_list in all_fixture_sets:
+                fixname = fixturename_list[0]
+                tails = [fix for fixlist in all_fixture_sets for fix in fixlist[1:]]
+                if fixname in tails:
+                    continue
+                new_order.append(fixname)
+                for fl in all_fixture_sets:
+                    if fixname in fl:
+                        fl.remove(fixname)
+                break
+            else:
+                raise Exception("Fixture resolution order could not be resolved")
+
+        arg2fixturedefs = {}  # type: Dict[str, Sequence[FixtureDef[Any]]]
+        for fixname in new_order:
+            fixturedefs = self.session._fixturemanager.getfixturedefs(fixname, self.nodeid)
+            if fixturedefs:
+                arg2fixturedefs[fixname] = fixturedefs
+
+        def sort_by_scope(arg_name: str) -> int:
+            try:
+                fixturedefs = arg2fixturedefs[arg_name]
+            except KeyError:
+                return fixtures.scopes.index("function")
+            else:
+                return fixturedefs[-1].scopenum
+
+        new_order.sort(key=sort_by_scope)
+        # strip out all fixtures that can't apply to groups of tests together
+        new_order = list(filter(lambda fixname: arg2fixturedefs[fixname][-1].scopenum < fixtures.scopes.index("function"), new_order))
+        autouse_fixture_names = self.session._fixturemanager._getautousenames(self.nodeid)
+        common_autouse_fixturename = None
+        while new_order:
+            fixname = new_order.pop()
+            if fixname in autouse_fixture_names:
+                common_autouse_fixturename = fixname
+                break
+        else:
+            # no autouse fixtures to work with
+            return
+        # overwrite ``fixturenames``
+        for node in nodes:
+            fixindex = node._fixtureinfo.names_closure.index(common_autouse_fixturename)
+            node._fixtureinfo.names_closure[:fixindex] = new_order
 
     def _genfunctions(self, name: str, funcobj) -> Iterator["Function"]:
         modulecol = self.getparent(Module)
